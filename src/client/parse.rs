@@ -625,11 +625,18 @@ pub(crate) fn parse_play(
     for s in rtp_info.as_str().split(',') {
         let s = s.trim();
         let mut parts = s.split(';');
-        let url = parts
-            .next()
-            .expect("split always returns at least one part")
-            .strip_prefix("url=")
-            .ok_or_else(|| "RTP-Info missing stream URL".to_string())?;
+        // Be lenient with cameras that don't include "url=" prefix in RTP-Info
+        let first_part = parts.next().expect("split always returns at least one part");
+        let url = match first_part.strip_prefix("url=") {
+            Some(url) => url,
+            None => {
+                log::warn!(
+                    "RTP-Info entry missing 'url=' prefix (non-compliant camera), skipping: {}",
+                    s
+                );
+                continue;
+            }
+        };
         let url = join_control(&presentation.base_url, url)?;
         let stream = if presentation.streams.len() == 1 {
             // The server is allowed to not specify a stream control URL for
