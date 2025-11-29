@@ -123,6 +123,16 @@ impl InorderParser {
         }
     }
 
+    /// Returns the learned SSRC if available (for RTCP RR generation)
+    pub fn ssrc(&self) -> Option<u32> {
+        self.ssrc.as_ref().map(|s| s.ssrc)
+    }
+
+    /// Returns the current sequence number state (for RTCP RR generation)
+    pub fn highest_seq(&self) -> Option<u16> {
+        self.seq.as_ref().map(|s| s.next.wrapping_sub(1))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn rtp(
         &mut self,
