@@ -1162,6 +1162,13 @@ struct SessionInner {
 
     keepalive_timer: Option<Pin<Box<tokio::time::Sleep>>>,
 
+    /// Timer for sending RTCP Receiver Reports (RR).
+    /// Some cameras require periodic RR packets to continue streaming.
+    rtcp_rr_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+
+    /// Our SSRC for RTCP RR packets (randomly generated per session).
+    client_ssrc: u32,
+
     /// Bitmask of [`SessionFlag`]s.
     flags: u8,
 
@@ -1518,6 +1525,9 @@ impl Session<Described> {
         })?;
         let describe_status = response.status();
         let sdp = response.into_body();
+        // Generate random client SSRC for RTCP RR
+        let client_ssrc = rand::random::<u32>();
+
         Ok(Session(
             Box::pin(SessionInner {
                 conn: Some(conn),
@@ -1530,6 +1540,8 @@ impl Session<Described> {
                 describe_status,
                 keepalive_state: KeepaliveState::Idle,
                 keepalive_timer: None,
+                rtcp_rr_timer: None,
+                client_ssrc,
                 flags: 0,
                 udp_next_poll_i: 0,
             }),
@@ -1917,6 +1929,11 @@ impl Session<Described> {
             };
         }
         *inner.keepalive_timer = Some(Box::pin(tokio::time::sleep(keepalive_interval(session))));
+
+        // Start RTCP RR timer - send first RR very quickly (100ms) to satisfy cameras
+        // that expect immediate feedback, then continue every 5 seconds
+        *inner.rtcp_rr_timer = Some(Box::pin(tokio::time::sleep(std::time::Duration::from_millis(100))));
+
         Ok(Session(self.0, Playing(())))
     }
 }
@@ -2174,6 +2191,52 @@ impl Session<Playing> {
             .expect("keepalive timer set in state Playing")
             .as_mut()
             .reset(tokio::time::Instant::now() + keepalive_interval);
+        Ok(())
+    }
+
+    /// Send RTCP Receiver Reports for all playing TCP streams.
+    /// Some cameras require periodic RR packets to continue streaming.
+    fn send_rtcp_rr(mut self: Pin<&mut Self>) -> Result<(), Error> {
+        let inner = self.0.as_mut().project();
+        let client_ssrc = *inner.client_ssrc;
+        let conn = inner.conn.as_mut().expect("have conn when sending RTCP RR");
+
+        for stream in inner.presentation.streams.iter() {
+            if let StreamState::Playing {
+                rtp_handler,
+                ctx,
+                ..
+            } = &stream.state
+            {
+                // Get SSRC and seq from the RTP handler
+                if let (Some(ssrc), Some(seq)) = (rtp_handler.ssrc(), rtp_handler.highest_seq()) {
+                    // Get RTCP channel (RTP channel + 1 for interleaved)
+                    if let StreamContext(StreamContextInner::Tcp(tcp_ctx)) = ctx {
+                        let rtcp_channel = tcp_ctx.rtp_channel_id + 1;
+
+                        // Build minimal RTCP RR
+                        let rr = crate::rtcp::build_receiver_report(
+                            client_ssrc,
+                            ssrc,
+                            seq as u32,  // Extended highest seq (just use 16-bit for now)
+                        );
+
+                        // Send via interleaved data channel
+                        let data_msg = rtsp_types::Message::Data(
+                            rtsp_types::Data::new(rtcp_channel, Bytes::copy_from_slice(&rr))
+                        );
+
+                        // Queue the message (non-blocking)
+                        if let Err(e) = conn.inner.start_send_unpin(data_msg) {
+                            // Ignore send errors - connection may be closing
+                            debug!("Failed to send RTCP RR for stream: {:?}", e);
+                        } else {
+                            debug!("Sent RTCP RR for stream: ssrc={:08x}, seq={}, channel={}", ssrc, seq, rtcp_channel);
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2539,6 +2602,7 @@ impl futures::Stream for Session<Playing> {
             // First try receiving data on the RTSP connection. Let this starve
             // sending keepalives; if we can't keep up, the server should
             // probably drop us.
+            trace!("Session poll_next: checking connection");
             match Pin::new(&mut self.0.conn.as_mut().unwrap().inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(msg))) => match msg.msg {
                     rtsp_types::Message::Data(data) => {
@@ -2585,6 +2649,22 @@ impl futures::Stream for Session<Playing> {
                 && matches!(t.as_mut().poll(cx), Poll::Ready(()))
             {
                 self.as_mut().handle_keepalive_timer(cx)?;
+            }
+
+            // Check if it's time to send RTCP Receiver Reports
+            // Some cameras require periodic RR to continue streaming
+            if let Some(t) = self.0.rtcp_rr_timer.as_mut()
+                && matches!(t.as_mut().poll(cx), Poll::Ready(()))
+            {
+                // Only send RR for TCP streams (interleaved)
+                if self.0.flags & (SessionFlag::TcpStreams as u8) != 0 {
+                    debug!("RTCP RR timer fired, sending RR");
+                    self.as_mut().send_rtcp_rr()?;
+                    // Immediately try to flush the RTCP RR to the network
+                    let _ = self.0.conn.as_mut().unwrap().inner.poll_flush_unpin(cx);
+                }
+                // Reset timer for next RR (every 500ms for aggressive cameras)
+                self.0.rtcp_rr_timer = Some(Box::pin(tokio::time::sleep(std::time::Duration::from_millis(500))));
             }
 
             // Then finish flushing the current keepalive if necessary.

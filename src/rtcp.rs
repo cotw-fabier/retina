@@ -401,9 +401,83 @@ impl<'a> PacketRef<'a> {
     }
 }
 
+// ============================================================================
+// RTCP Receiver Report Builder (for cameras that require RR feedback)
+// ============================================================================
+
+/// Build a minimal RTCP Receiver Report packet.
+///
+/// This creates a 32-byte RR packet with mostly zeroed statistics.
+/// Some cameras require periodic RR packets to continue streaming.
+///
+/// # Arguments
+/// * `sender_ssrc` - Our SSRC as the receiver/sender of this RR
+/// * `source_ssrc` - SSRC of the source we're reporting on (from RTP packets)
+/// * `highest_seq` - Extended highest sequence number received
+///
+/// # Returns
+/// A 32-byte RTCP Receiver Report packet
+pub fn build_receiver_report(sender_ssrc: u32, source_ssrc: u32, highest_seq: u32) -> [u8; 32] {
+    let mut buf = [0u8; 32];
+
+    // Header (4 bytes)
+    buf[0] = 0x81;  // V=2, P=0, RC=1 (one report block)
+    buf[1] = 201;   // PT = 201 (Receiver Report)
+    buf[2..4].copy_from_slice(&7u16.to_be_bytes());  // Length = 7 (32-bit words - 1)
+
+    // Sender SSRC (4 bytes)
+    buf[4..8].copy_from_slice(&sender_ssrc.to_be_bytes());
+
+    // Report Block (24 bytes)
+    // SSRC of source being reported (4 bytes)
+    buf[8..12].copy_from_slice(&source_ssrc.to_be_bytes());
+
+    // Fraction lost (1 byte) + Cumulative packets lost (3 bytes) = 0
+    // buf[12..16] already zeroed
+
+    // Extended highest sequence number received (4 bytes)
+    buf[16..20].copy_from_slice(&highest_seq.to_be_bytes());
+
+    // Interarrival jitter (4 bytes) = 0
+    // buf[20..24] already zeroed
+
+    // Last SR timestamp (4 bytes) = 0
+    // buf[24..28] already zeroed
+
+    // Delay since last SR (4 bytes) = 0
+    // buf[28..32] already zeroed
+
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_receiver_report() {
+        let rr = build_receiver_report(0x12345678, 0xABCDEF01, 0x0000FFFF);
+
+        // Check header
+        assert_eq!(rr[0], 0x81);  // V=2, P=0, RC=1
+        assert_eq!(rr[1], 201);   // PT = RR
+
+        // Check length (7 in network byte order)
+        assert_eq!(rr[2], 0);
+        assert_eq!(rr[3], 7);
+
+        // Check sender SSRC
+        assert_eq!(&rr[4..8], &0x12345678u32.to_be_bytes());
+
+        // Check source SSRC
+        assert_eq!(&rr[8..12], &0xABCDEF01u32.to_be_bytes());
+
+        // Check highest seq
+        assert_eq!(&rr[16..20], &0x0000FFFFu32.to_be_bytes());
+
+        // Total length
+        assert_eq!(rr.len(), 32);
+    }
 
     #[test]
     fn dahua() {
