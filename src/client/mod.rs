@@ -2143,12 +2143,20 @@ impl Session<Playing> {
             KeepaliveState::Idle => {}
         }
 
-        // Currently the only outbound data should be keepalives, and the previous one
-        // has already been flushed, so there's no reason the Sink shouldn't be ready.
+        // The previous keepalive has been flushed, but RTCP receiver reports
+        // share this sink, so on a congested uplink it may still be busy.
+        // That is not fatal: defer the keepalive briefly instead of failing
+        // the whole session. (If the uplink never drains, the server's
+        // session timeout / the caller's stall detection ends the session.)
         if matches!(conn.inner.poll_ready_unpin(cx), Poll::Pending) {
-            bail!(ErrorInt::Internal(
-                "Unexpectedly not ready to send keepalive".into()
-            ));
+            debug!("sink not ready to send keepalive; deferring");
+            inner
+                .keepalive_timer
+                .as_mut()
+                .expect("keepalive timer set in state Playing")
+                .as_mut()
+                .reset(tokio::time::Instant::now() + std::time::Duration::from_millis(500));
+            return Ok(());
         }
 
         // Send a new keepalive and reset the timer.
@@ -2196,7 +2204,10 @@ impl Session<Playing> {
 
     /// Send RTCP Receiver Reports for all playing TCP streams.
     /// Some cameras require periodic RR packets to continue streaming.
-    fn send_rtcp_rr(mut self: Pin<&mut Self>) -> Result<(), Error> {
+    fn send_rtcp_rr(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Result<(), Error> {
         let inner = self.0.as_mut().project();
         let client_ssrc = *inner.client_ssrc;
         let conn = inner.conn.as_mut().expect("have conn when sending RTCP RR");
@@ -2225,6 +2236,15 @@ impl Session<Playing> {
                         let data_msg = rtsp_types::Message::Data(
                             rtsp_types::Data::new(rtcp_channel, Bytes::copy_from_slice(&rr))
                         );
+
+                        // `start_send` requires a prior successful
+                        // `poll_ready`. If the sink is backed up (congested
+                        // uplink), skip this RR rather than overfilling the
+                        // write buffer; the next timer tick sends a fresh one.
+                        if !matches!(conn.inner.poll_ready_unpin(cx), Poll::Ready(Ok(()))) {
+                            debug!("sink not ready; skipping RTCP RR");
+                            return Ok(());
+                        }
 
                         // Queue the message (non-blocking)
                         if let Err(e) = conn.inner.start_send_unpin(data_msg) {
@@ -2659,7 +2679,7 @@ impl futures::Stream for Session<Playing> {
                 // Only send RR for TCP streams (interleaved)
                 if self.0.flags & (SessionFlag::TcpStreams as u8) != 0 {
                     debug!("RTCP RR timer fired, sending RR");
-                    self.as_mut().send_rtcp_rr()?;
+                    self.as_mut().send_rtcp_rr(cx)?;
                     // Immediately try to flush the RTCP RR to the network
                     let _ = self.0.conn.as_mut().unwrap().inner.poll_flush_unpin(cx);
                 }
